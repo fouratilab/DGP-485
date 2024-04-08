@@ -1,0 +1,486 @@
+---
+title: "Applying MOFA to the Hepatitis B vaccine datasets"
+author: 
+  name: "Slim Fourati"
+  affiliation: "Northwestern University"
+  email: "slim.fourati@northwestern.edu"
+date: "`r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+# Introduction
+The study includes 174 participants that received three vaccines a dual Hepatitis A/B vaccine, a dual diphteria and tetanus and a vaccine against cholera. Blood samples were collected before vaccination and 7 days after the first immunization. Blood samples were profilled by microarray (Affymetrix array), flow cytometry, cytokines/chemokines profiling in plasma. Further details on the datasets can be found in this [article](https://www.nature.com/articles/ncomms10369). 
+Today you are going to use datasets only at the prevaccination time point and determine if any multi-Omic factor is associated with response to vaccination.
+
+# Load libraries
+Make sure that you have installed the [MOFA2](https://github.com/bioFAM/MOFA2#installation) package.
+```{r load-packages}
+suppressPackageStartupMessages(library(package = "MOFA2"))
+suppressPackageStartupMessages(library(package = "psych"))
+suppressPackageStartupMessages(library(package = "fgsea"))
+suppressPackageStartupMessages(library(package = "knitr"))
+suppressPackageStartupMessages(library(package = "ggpubr"))
+suppressPackageStartupMessages(library(package = "tidyverse"))
+```
+
+# Load Omic datasets
+Data is stored as a list of matrices. Features are stored in the rows and samples in the columns
+```{r load-omics-ls}
+load(file = "HepB_data.RData")
+lapply(HepB_data,dim)
+```
+
+## mRNA expression
+The mRNA expression has been quantile normalized using the function affy::rma (https://bioconductor.org/packages/release/bioc/html/affy.html). The top 5000 most varying genes are provided.
+```{r mrna}
+hist(HepB_data$mRNA)
+```
+
+## Flow cytometry
+Absolute counts and relative frequencies of the main immune cells in blood.
+```{r flow}
+hist(HepB_data$FlowCytometryCount)
+hist(HepB_data$FlowCytometryPercent)
+```
+
+## Cytokines/Chemokines
+Cytokines and Chemokines protein levels in plasma measured by an multiplex ELISA.
+```{r cyto-chemo}
+hist(HepB_data$Cytokines_Chemokines)
+```
+
+## Sample metadata 
+Read sample metadata provided as a CSV file. Important columns are:
+- **age**: age in years
+- **gender**: sex of the participant F (female), M (male)
+- **hepatitis b average concentration (pre-vax)**: HepatitisB-specific antibody titers pre-vaccination
+- **hepatitis b average concentration (post-vax)**: Antibody titers 1 month after the 2nd immunization with the HepB vaccine
+```{r read-metadata}
+HepB_metadata <- read_csv("HepB_metadata.csv", show_col_types = FALSE)
+
+head(HepB_metadata) %>%
+  kable()
+```
+
+# Create the MOFA object and train the model
+Create the MOFA object
+```{r create-mofa-obj, warning=FALSE, message=FALSE}
+MOFAobject <- create_mofa(HepB_data)
+MOFAobject
+```
+
+## Plot data overview
+Visualise the number of views (rows) and the number of groups (columns) exist, what are their corresponding dimensionalities and how many missing information they have (grey bars).
+```{r data-overview}
+plot_data_overview(MOFAobject)
+```
+
+## Define MOFA options
+### Model options
+Two important options:
+- **num_factors**: number of factors
+- **likelihoods**: likelihood per view (options are "gaussian", "poisson", "bernoulli"). By default the "gaussian" distribution is used. When having binary data one should change the likelihood to "bernoulli".
+mutations, one should change the likelihood to "bernoulli":
+```{r mofa-opts}
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 15
+model_opts
+```
+
+## Train the MOFA model
+Prepare the MOFA object
+```{r mofa-prep-train, message=FALSE, warning=FALSE}
+MOFAobject <- prepare_mofa(MOFAobject, model_options = model_opts)
+```
+
+```{r mofa-train, message=FALSE, warning=FALSE}
+set.seed(seed = 42)
+MOFAobject <- run_mofa(MOFAobject)
+```
+Train the model: this should take ~1min. 
+
+## Add sample metadata to the model
+The sample metadata must be provided as a data.frame and it must contain a column `sample` with the sample IDs. Make sure that the samples in the metadata match the samples in the model
+```{r}
+stopifnot(HepB_metadata$sample %in% samples_metadata(MOFAobject)$sample)
+
+# surrogate replacement of background titers
+HepB_metadata$"Hepatitis B Average Concentration (post-vax)"[HepB_metadata$"Hepatitis B Average Concentration (post-vax)" %in% "<5"] <- 5
+HepB_metadata$"Hepatitis B Average Concentration (post-vax)"[HepB_metadata$"Hepatitis B Average Concentration (post-vax)" %in% "<5"] <- 5
+samples_metadata(MOFAobject) <- HepB_metadata[match(samples_metadata(MOFAobject)$sample,
+                                                    table = HepB_metadata$sample), ]
+```
+
+## Variance decomposition analysis
+### Variance decomposition by Factor 
+**The most important insight that MOFA generates is the variance decomposition analysis**. This plot shows the percentage of variance explained by each factor across each data modality.
+```{r factor-var}
+plot_variance_explained(MOFAobject, max_r2 = 5)
+```
+- **Factor 1** captures a strong source of variation that is exclusive to the mRNA data.
+- **Factor 2** capture a source of variability that is present across almost all data modalities. Thus, its etiology is likely to be something very important for the disease.
+- **Factor 3** is capturing some co-variation between the mRNA and the Flow cytometry. 
+- **Factor 4** and **Factor 5** is capturing some co-variation between the mRNA and the Cytokines/Chemokines. 
+
+**(Q) Based on the MOFA output, if you were to profile just one molecular layer, which one would you choose to maximise the amount of sources of variation captured?**
+
+# Characterisation of Factor 2
+There are a few systematic strategies to characterise the molecular signal that underlies each MOFA Factor and to relate them to existent sample covariates:
+- **Association analysis between the sample metadata and the Factor values**.  
+- **Inspection of factor values**.  
+- **Inspection of the feature weights**.  
+- **Gene set enrichment analysis on the mRNA weights**. 
+
+## Association analysis
+Let's test the association between the MOFA factors versus sex and age:
+```{r mofa-age-sex}
+correlate_factors_with_covariates(MOFAobject, 
+                                  covariates = c("gender",
+                                                 "age"), 
+                                  plot       = "log_pval")
+
+correlate_factors_with_covariates(MOFAobject, 
+                                  covariates = c("Diphtheria Average Concentration (post-vax)",
+                                                 "Tetanus Average Concentration (post-vax)",
+                                                 "Hepatitis B Average Concentration (post-vax)",
+                                                 "Cholera Normalized Titer (post-vax)"), 
+                                  plot       = "log_pval")
+```
+Some Factors have a clear association with sex and age. Factor 2 has a (weak) don't have a clear association with any of the covariates. Only Factor 3 has a (weak) association with Diphtheria titers. We will explore association with clinical measurements later in the vignette.
+
+later in the vignette.
+
+## Inspection of factor values
+
+**How do we interpret the factor values?**  
+Each factor captures a different source of variability in the data. Mathematically, each Factor is defined by a linear combination of the input features. Each Factor ordinates cells along a one-dimensional axis that is centered at zero. Samples with different signs manifest opposite phenotypes along the inferred axis of variation, with higher absolute value indicating a stronger effect.  
+Note that the interpretation of MOFA factors is analogous to the interpretation of the principal components in PCA.
+```{r mofa-pca}
+plot_factors(MOFAobject, factors = c(2, 3), dot_size = 2.5)
+```
+
+## Inspection of feature weights
+
+**How do we interpret the feature weights?**  
+The weights provide a score for each feature on each factor. Features with no association with the corresponding factor are expected to have values close to zero, whereas features with strong association with the factor are expected to have large absolute values. The sign of the weights indicates the direction of the effect: a positive weights indicates that the feature has higher levels in the cells with positive factor values, and vice-versa.  
+
+### Plot feature weights for somatic mutations
+By looking at the variance explained plot, we saw that Factor 2 captures variation in all data modalities. Let's start with flow cytometry data, the Omics with the smallest number of features. Let's plot the weights:
+
+```{r mofa-factor2-weight}
+plot_weights(MOFAobject,
+             view      = "FlowCytometryCount",
+             factor    = 2,
+             nfeatures = 10, # Top number of features to highlight
+             scale     = TRUE) # Scale weights from -1 to 1
+```
+Notice that most features lie at zero, indicating that most features have no association with Factor 2. There is however one cell subset that clearly stands out: counts of CD3-positive T cells.
+
+An alternative visualisation to the full distribution of weights is to do a line plot that displays only the top features with the corresponding weight sign on the right:
+```{r mofa-factor2-weight-dist}
+plot_top_weights(MOFAobject,
+                 view      = "FlowCytometryCount",
+                 factor    = 2,
+                 nfeatures = 10, # Top number of features to highlight
+                 scale     = TRUE) # Scale weights from -1 to 1
+```
+
+Count of CD3-positive T cells has a positve weight. This means that samples with positive Factor 1 values have more absolute number of T cells pre-vaccination whereas samples with negative Factor 1 values do not have a lower amount of T cells. To confirm this, let's plot the Factor values and colour the T cell counts. 
+```{r mofa-factor2-tcell}
+plot_factor(MOFAobject, 
+            factors      = 2, 
+            color_by     = "CT CD3",
+            show_missing = FALSE)
+```
+
+We can also plot Factor values coloured by other covariates, for example `gender`. As concluded from the association analysis above, this variable has no association with Factor 2:
+```{r mofa-factor2-sex}
+plot_factor(MOFAobject, 
+            factors    = 2, 
+            color_by   = "gender",
+            dodge      = TRUE,
+            add_violin = TRUE)
+```
+
+### Plot gene weights for mRNA expression
+From the variance explained plot we know that Factor 2 drives variation across all data modalities. Let's visualise the mRNA expression changes that are associated with Factor 2:
+```{r mofa-factor2-mrna}
+plot_weights(MOFAobject, 
+             view      = "mRNA", 
+             factor    = 2, 
+             nfeatures = 10)
+```
+
+### Plot molecular signatures in the input data 
+In this case we have a large amount of genes that have large negative weights. Genes with large negative values will be more expressed in the samples low T cell counts. Let's verify this. The function `plot_data_scatter`  generates a scatterplot of Factor 2 values (x-axis) versus expression values (y-axis) for the top 4 genes with largest positive weight. Samples are coloured by T cell counts:
+```{r mofa-factor2-mrna-tcell}
+plot_data_scatter(MOFAobject, 
+                  view     = "mRNA",
+                  factor   = 2,  
+                  features = 4,
+                  sign     = "negative",
+                  color_by = "CT CD3") + 
+  labs(y="RNA expression")
+```
+
+An alternative visualisation is to use a heatmap
+```{r mofa-facto2-mrna-heat}
+plot_data_heatmap(MOFAobject, 
+                  view          = "mRNA",
+                  factor        = 2,  
+                  features      = 25,
+                  cluster_rows  = FALSE,
+                  cluster_cols  = TRUE,
+                  show_rownames = TRUE,
+                  show_colnames = FALSE,
+                  scale         = "row")
+```
+
+# Prediction of individual markers for personalised treatment based on the patient's IGHV status
+
+**(Q) Can you identify cytokines/chemokines markers associated to Factor 2 (total T cells counts)?**  
+First explore the MOFA weights, then go back to the input data and do scatterplot for the chosen markers (x-axis being the T cell counts and y-axis being the cytokine/chemokine marker's expression). 
+Hints: 
+- The section [Customized analysis](#customized-analysis) may be helpful to extract the weights and the data in a long data.frame format
+- the T cell counts (`CT CD3`) for each sample can be fetched from the `HepB_data$FlowCytometryCount`.
+- the [ggpubr](http://www.sthda.com/english/articles/24-ggpubr-publication-ready-plots/) package provides very useful ggplot-based visualisations, including [boxplots with p-values](http://www.sthda.com/english/articles/24-ggpubr-publication-ready-plots/78-perfect-scatter-plots-with-correlation-and-marginal-histograms/). I highly recommend it!
+
+# Characterisation of Factor 3
+**(Q) Your task is to provide a characterisation for Factor 3**.  
+Try a similar pipeline as for Factor 2 and answer the following questions:  
+- Which immune cell subset underlies Factor 3?  
+- Can you identify mRNA markers?  
+
+# Gene set enrichment analysis
+In addition to exploring the individual weights for each factor, we can use enrichment analysis to look for significant associations of factors to genesets. Here, we use the MSigDB hallmark genesets for illustrations, which is provided as a GMT file. For more details on how the GSEA works we encourage the users to read the [GSEA vignette](https://raw.githack.com/bioFAM/MOFA2/master/MOFA2/vignettes/GSEA.html)
+
+## Read Hallmark gene set annotations.  
+Gene set annotations are provided as a binary membership matrix. Genes are stored in the rows, pathways are stored in the columns. A value of 1 indicates that gene $j$ belongs to the pathway $i$.
+```{r load-hallmark}
+hallmarkGS <- gmtPathways("h.all.v2023.2.Hs.symbols.gmt") %>%
+  stack() %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = values, values_from = value, values_fill = 0) %>%
+  column_to_rownames(var = "ind") %>%
+  as.matrix()
+```
+
+## Run enrichment analysis
+These are the steps for doing [Gene Set Enrichment Analysis (GSEA) with MOFA](https://raw.githack.com/bioFAM/MOFA2/master/MOFA2/vignettes/GSEA.html):  
+- **(1) Define your gene set matrix**: this can be specified as a binary matrix where rows are gene sets and columns are genes. A value of 1 indicates that gene `j` belongs to pathway `i`. A value of 0 indicates elsewise.  
+- **(2) Select a gene set statistic**: the statistic used to quantify the scores at the pathway level. Must be one of the following: `mean.diff` (difference in the average weight between foreground and background genes) or `rank.sum` (difference in the sum of ranks between foreground and background genes).  
+- **(3) Select a statistical test**: the statistical test used to compute the significance of the gene set statistics under a competitive null hypothesis. Must be one of the following: `parametric` (a simple and very liberal parametric t-test), `cor.adj.parametric` (parametric t-test adjusted by the correlation between features), `permutation` (unparametric, the null distribution is created by permuting the weights. This option is computationally expensive, but it preserves the correlation structure between features in the data.).  
+```{r mofa-enrichment, message=FALSE}
+enrichment.results <- run_enrichment(MOFAobject, 
+                                     view             = "mRNA",
+                                     factors          = 1:5,
+                                     feature.sets     = hallmarkGS, 
+                                     set.statistic    = "mean.diff",
+                                     statistical.test = "parametric")
+```
+
+The enrichment analysis returns a list of 5 elements:
+- **feature.sets**:	the feature set matrix filtered by the genes that overlap with the MOFA model.  
+- **pval**:	the nominal p-values.  
+- **pval.adj**:	the FDR-adjusted p-values.  
+- **feature.statistics**: the feature statistics (i.e. the weights).  
+- **set.statistics**: matrices with the gene set statistics.  
+- **sigPathways**: list with significant pathways per factor at a specified FDR threshold  
+```{r print-enrichment-names}
+names(enrichment.results)
+```
+
+## Plot enrichment analysis results
+Plot an overview of the number of significant pathways per factor.  
+It seems that most of the Factors do not have clear gene set signatures. A clear exception is Factor 2, which has a very strong enrichment for genes with positive weights.
+```{r}
+plot_enrichment_heatmap(enrichment.results)
+```
+
+**(Q) Can you characterise Factor 2 based on the GSEA results? Which genes are driving the top enriched pathways?**  
+Hint: use the functions `plot_enrichment`
+
+# Customized analysis
+For customized exploration of weights and factors, you can directly fetch the variables from the model using `get_weights` and `get_factors`:
+```{r mofa-weights-all}
+factors1_to_5_weights <- get_weights(MOFAobject, 
+                       views        = "all", 
+                       factors       = 1:5, 
+                       as.data.frame = TRUE)
+head(factors1_to_5_weights)
+```
+
+```{r mofa-get-factors}
+mofa_factors <- get_factors(MOFAobject, 
+                            factors       = 1:5, 
+                            as.data.frame = TRUE)
+head(mofa_factors)
+```
+
+# Building predictive models of diphteria response
+The factors inferred by MOFA can be related to clinical outcomes such as response to vaccination. Antibody titers is a continous variable, we will use linear regression for this purpose. In particular:
+- If the coefficient is positive, samples with large factor values have an increased vaccine response compared to samples with small factor values.
+- If the coefficient is negative, samples with small factor values have an increased vaccine response compared to samples with a large factor values.
+
+To fit these models we will use the `glm` function in the `stat` package.
+
+### Fit linear regression models
+```{r mofa-glm}
+titers <- samples_metadata(MOFAobject)$"Diphtheria Average Concentration (post-vax)" %>%
+  gsub(pattern = "<", replacement = "") %>%
+  as.numeric()
+X <- get_factors(MOFAobject)[[1]]
+fit <- glm(rank(titers) ~ X) 
+summary(fit)
+```
+
+We can see that one factor has a significant association to time diphteria response. Factor 3 has a positive coefficient. Samples with high factor values have an higher titers compared to samples with a low factor values.
+
+### Plot Scatter lot
+**(Q) Which Factors are associated with the clinical covariate (titers)?**
+Extract p-values and coefficients
+```{r get-glm-stats}
+s <- summary(fit)
+coef <- s[["coefficients"]]
+
+df <- data.frame(factor = factor(rownames(coef), levels = rev(rownames(coef))),
+                 p      = coef[,"Pr(>|t|)"], 
+                 coef   = coef[,"Estimate"],
+                 lower  = confint(fit)[, "2.5 %"],
+                 higher = confint(fit)[, "97.5 %"]) %>%
+  filter(factor != "(Intercept)")
+```
+
+Plot the Hazard ratio per factor, together with 95% confidence intervals
+```{r forest-plot}
+ggplot(data = df,
+       mapping = aes(x = factor, y = coef, ymin = lower, ymax = higher, color = p<0.05)) +
+  geom_pointrange() + 
+  coord_flip() +
+  scale_x_discrete() + 
+  labs(y="Regression coefficient", x="") + 
+  geom_hline(aes(yintercept=1), linetype="dotted") +
+  theme_bw()
+```
+
+# Solutions
+### (Q) Based on the MOFA output, if you were to profile just one molecular layer, which one would you choose to maximise the amount of sources of variation captured?
+By inspecting the variance explained plot, we can see that the nRNA expression is capturing most of the sources of variation in this data set. There are only a few Factors that cannot be captured using RNA expression (for example Factors 5 and 11). The other two data modalities are less informative: Flow cytometry data is only active in Factor 2, and 3.  
+
+If were were to profile just one molecular layer for a large number of patients in a cost-effective way, we would need to compare the feasibility and costs of Cytokines/Chemokines and RNA sequencing. The former is much cheaper.
+
+### (Q) Can you identify cytokines/chemokines markers associated to Factor 2 (total T cells counts)?**  
+We first collect the proteins with the largest weights for Factor 2. Then we generate scatter plots showing the association with total T cell counts, followed by statiscal testing with the null hypothesis that there is no association with T cell counts (a simple Spearman correlation should work for a first exploration).  
+
+Extract mRNA weights from the MOFA object
+```{r mofa-factor2-cyto-chemo}
+cyto.chemo.weights <- get_weights(MOFAobject, 
+                                  views         = "Cytokines_Chemokines", 
+                                  factors       = 2, 
+                                  as.data.frame = TRUE)
+
+# Extract top N proteins
+top.prot <- cyto.chemo.weights %>%
+  arrange(desc(abs(value))) %>%
+  head(n = 10) %>% 
+  .$feature %>% 
+  as.character
+head(top.prot)
+```
+
+Fetch cytokines/chemokines data from the MOFAobject for the top proteins
+```{r mofa-top-prot-factor2}
+prot.data <- get_data(MOFAobject, 
+                      views         = "Cytokines_Chemokines", 
+                      as.data.frame = TRUE,
+                      features      = list("Cytokines_Chemokines" = top.prot))
+head(prot.data)
+```
+
+Add CT CD3 from flow cytometry 
+```{r add-cd3}
+to.plot <- get_data(MOFAobject, 
+                    views         = "FlowCytometryCount", 
+                    as.data.frame = TRUE,
+                    features      = list("FlowCytometryCount" = "CT CD3")) %>%
+  pivot_wider(names_from = "feature", values_from = value) %>%
+  select(sample, `CT CD3`) %>%
+  merge(x = prot.data, by = "sample")
+colnames(to.plot)
+```
+
+Scatterplots with statistical comparison of means
+```{r scatter-cd3}
+ggplot(data = to.plot,
+       mapping = aes(x = value, y = `CT CD3`)) +
+  geom_point() +
+  stat_cor(method = "spearman",cor.coef.name = "rho") +
+  labs(x = "T cell counts", y="Cytokine/Chemokine expression") +
+  facet_wrap(facets = ~feature)
+  theme(legend.position="none")
+```
+
+### (Q) Provide a characterisation for Factor 3
+Following a similar strategy as for Factor 2, we notice that Factor 3 is also active in the flow cytometry view. Thus, there must be a cell subset that underlies this phenotype. Let's plot the corresponding weights:
+```{r mofa-factor3-flow}
+plot_weights(MOFAobject, 
+             view      = "FlowCytometryPercent", 
+             factor    = 3, 
+             nfeatures = 5,
+             abs       = FALSE)
+```
+In this case we have three subsets that have large weights. One of them is effector memory CD8.  
+
+Let's verify this by plotting the Factor values as function of effector memory CD8 percent:
+```{r mofa-factor3-emcd8}
+plot_factor(MOFAobject, 
+            factors  = 3, 
+            color_by = "PCT EM in CD8")
+```
+
+As we did for the factor 2 we can also inspect the mRNA signatures in the input data with the functions `plot_data_scatter` and `plot_data_heatmap`:
+```{r mofa-factor3-scatter}
+plot_data_scatter(MOFAobject, 
+                  view     = "mRNA",
+                  factor   = 3,  
+                  features = 4,
+                  color_by = "PCT EM in CD8") +
+  stat_cor(method = "spearman", cor.coef.name = "rho")
+```
+
+```{r mofa-factor3-heat}
+plot_data_heatmap(MOFAobject, 
+                  view          = "mRNA",
+                  factor        = 3,  
+                  features      = 25,
+                  cluster_rows  = TRUE, 
+                  cluster_cols  = FALSE,
+                  show_rownames = TRUE,
+                  show_colnames = FALSE,
+                  scale         = "row")
+```
+
+### (Q) Characterise Factor 3 based on the GSEA results?
+Plotting the GSEA results for Factor 3 reveals that this Factor is capturing differences in the interferon gamma response.
+```{r mofa-factor-3-gsea}
+plot_enrichment(enrichment.results, 
+                factor       = 3, 
+                max.pathways = 15)
+```
+
+### (Q) Which Factors are associated with the clinical covariate (vaccine response)
+Factor 3 is statistically associated with diphteria response.
+
+
+# sessionInfo
+<details>
+  <summary>**Session Info**</summary>
+```{r}
+sessionInfo()
+```
+</details>
+
+
