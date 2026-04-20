@@ -29,17 +29,13 @@ This practical is built around a **public 10x Genomics BEAM-T dataset** generate
 Input dataset was download from the 10x Genomics dataset page (https://www.10xgenomics.com/datasets/5k-human-a0201-b0702-pbmcs-beam-t-2-standard) and place in current working directory called `demo_tcr/`.
 This demo uses:  
 - `filtered_contig_annotations.csv`
-- `clonotypes.csv`
-- `consensus_annotations.csv`
 
 ## Folder structure
 ```text
 DGP-485/
 └── demo_tcr/
     ├── 20260420_DGP845.BCR_TCR_repertoire.Rmd
-    ├── filtered_contig_annotations.csv
-    ├── clonotypes.csv
-    └── consensus_annotations.csv
+    └── filtered_contig_annotations.csv
 ```
 
 ## Load packages
@@ -56,15 +52,11 @@ suppressPackageStartupMessages(library(package = "tidyverse"))
 # 2. Read the TCR data
 ```{r read-data}
 contigsDF <- read.csv("filtered_contig_annotations.csv")
-clonotypesDF <- read.csv("clonotypes.csv")
-consensusDF <- read.csv("consensus_annotations.csv")
 ```
 
 Print the header
 ```{r inspect-data}
 head(contigsDF)
-head(clonotypesDF)
-head(consensusDF)
 ```
 
 # 3. Contig summary
